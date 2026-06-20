@@ -148,7 +148,7 @@
     <div class="toolbar">
       <button class="btn sm edit-only" onclick="openBulk()">🔁 일괄 변경</button>
       <button class="btn sm edit-only" onclick="normalizeArrows()">↹ 표기 통일</button>
-      <button class="btn sm primary edit-only" onclick="exportViewer()">📤 공유본 내보내기</button>
+      <button class="btn sm primary edit-only" onclick="openPublish()">📤 공유본 발행</button>
       <button class="btn sm" onclick="exportCSV()">⬇ 엑셀(CSV)</button>
       <button class="btn sm" onclick="exportJSON()">⬇ 백업(JSON)</button>
       <button class="btn sm edit-only" onclick="document.getElementById('importFile').click()">⬆ 불러오기</button>
@@ -158,12 +158,14 @@
   </header>
 
   <nav class="tabs" id="tabs">
-    <button class="tab active" data-view="viz" onclick="setView('viz')">IVR구조</button>
+    <button class="tab active" data-view="viz" onclick="vizModuleId=null;setView('viz')">IVR구조</button>
     <button class="tab" data-view="tree" onclick="setView('tree')">구조트리상세</button>
+    <button class="tab" data-view="mod" onclick="modEditId=null;setView('mod')">공통 IVR</button>
     <button class="tab" data-view="lift" onclick="setView('lift')">리프트 전달용</button>
     <button class="tab" data-view="tpl" onclick="setView('tpl')">알림톡 템플릿</button>
     <button class="tab" data-view="table" onclick="setView('table')">IVR 요약표</button>
     <button class="tab" data-view="val" onclick="setView('val')">검증 <span class="badge" id="valBadge" style="display:none">0</span></button>
+    <button class="tab" data-view="hist" onclick="setView('hist')">이력관리</button>
   </nav>
 
   <div class="main">
@@ -12051,10 +12053,12 @@ const LS_KEY = 'ivr_dashboard_state_v2';
 const READONLY = true;
 
 /* ---------- state ---------- */
-let state = null;       // {services:[], templates:[]}
+let state = null;       // {services:[], templates:[], lift:[], modules:[]}
 let view = 'viz';
 let curServiceId = null;
 let curNodeId = null;
+let ctxKind = 'service';   // 'service' | 'module' — 편집 컨텍스트
+let ctxModuleId = null;
 
 /* ---------- normalization from raw excel extract ---------- */
 function serviceNameFromSheet(sheet){
@@ -12107,13 +12111,37 @@ function normalizeRaw(raw, alim){
     id:uid(), profile:t.profile||'', ivrNo:t.ivrNo||'', uuid:t.uuid||'', code:t.code||'',
     name:t.name||'', body:t.body||'', btn1:t.btn1||'', btn1Url:t.btn1Url||'', btn2:t.btn2||'', btn2Url:t.btn2Url||''
   }));
-  const st={services, templates, lift:(alim.lift||[])};
+  const st={services, templates, lift:(alim.lift||[]), modules:[], history:[]};
   restructureRegions(st);
   applyFigmaMemos(st);
   applyMents(st);
   applyPhones(st, phoneData());
   autoLink(st);
+  applyCommonModules(st);
   return st;
+}
+function labelSet(arr){ return arr.map(n=>(n.label||'').trim()).sort().join('|'); }
+function applyCommonModules(st){
+  if(!st.modules) st.modules=[];
+  if(st.modules.length) return; // 이미 공통 IVR이 있으면 건너뜀(멱등)
+  const region=st.services.filter(s=>isRegionService(s) && s.name!=='상주');
+  const stripClone=arr=>{ const c=cloneNodes(arr); (function w(l){ for(const n of l){ (n.entries||[]).forEach(e=>{e.templateId='';e.url='';}); w(n.children||[]); } })(c); return c; };
+  const DEFS=[
+    {re:/고유가/, name:'고유가 피해지원금 안내', desc:'2차 고유가 피해지원금 하위 안내 (지역화폐 공통)'},
+    {re:/카드 신청, 배송 및 등록|카드 신청.*배송.*등록/, name:'카드 신청·배송·등록 흐름', desc:'카드 신청/재발급·배송·등록 등 (지역화폐 공통)'},
+    {re:/분실 신고/, name:'분실 신고·해제 흐름', desc:'분실 신고/해제 (회원·비회원) (지역화폐 공통)'},
+    {re:/서비스 이용 및 거래/, name:'서비스 이용·거래 안내 흐름', desc:'서비스이용·인센티브·상담원 등 (지역화폐 공통)'}
+  ];
+  for(const d of DEFS){
+    const cands=[]; region.forEach(s=>walk(s.tree,n=>{ if(d.re.test(n.label) && n.children.length) cands.push(n); }));
+    if(cands.length<2) continue;
+    const groups={}; cands.forEach(n=>{ const k=labelSet(n.children); (groups[k]=groups[k]||[]).push(n); });
+    let best=null; for(const k in groups){ if(groups[k].length>=2 && (!best||groups[k].length>best.length)) best=groups[k]; }
+    if(!best) continue;
+    const m={id:uid(),name:d.name,desc:d.desc,tree:stripClone(best[0].children)};
+    best.forEach(n=>{ n.children=[]; n.moduleRef=m.id; });
+    st.modules.push(m);
+  }
 }
 const GOYUGA_SUBS=[['1','신청 방법 및 조회'],['2','지급 일정과 지급금액'],['3','지급 대상'],['4','잔액조회'],['5','사용처 및 유효기간 문의'],['6','신청 오류 및 지급 오류'],['7','이의신청 문의'],['8','알림톡 또는 메시지 수신 차단/미수신 문의']];
 function applyFigmaMemos(st){
@@ -12188,11 +12216,18 @@ function applyPhones(st, phone){
     if(ph) s.phone=ph;
   }
 }
-function leafPaths(tree){ // returns [{node, menu, sub, entries}]
+function leafPaths(tree){ // .children only (공통 IVR 미전개) — autoLink용
   const out=[];
   const rec=(list,labels)=>{ for(const n of list){ const lb=[...labels,n.label];
     if(!n.children.length){ out.push({node:n, menu:lb[1]||'', sub:lb[2]||''}); }
     rec(n.children,lb); } };
+  rec(tree,[]); return out;
+}
+function leafPathsEff(tree){ // effChildren(공통 IVR 전개) — 리프트/표시용
+  const out=[];
+  const rec=(list,labels)=>{ for(const n of list){ const lb=[...labels,n.label]; const kids=effChildren(n);
+    if(!kids.length){ out.push({node:n, menu:lb[1]||'', sub:lb[2]||''}); }
+    rec(kids,lb); } };
   rec(tree,[]); return out;
 }
 function tplUrl(t){ if(!t)return ''; if(t.btn1Url)return t.btn1Url; if(t.btn2Url)return t.btn2Url;
@@ -12243,10 +12278,10 @@ function alimData(){ try{ return JSON.parse($('#alimdata').textContent); }catch(
 function phoneData(){ try{ return JSON.parse($('#phonedata').textContent); }catch(e){ return {rows:[]}; } }
 function load(){
   const bakedEl=$('#bakedstate'); const baked=bakedEl?bakedEl.textContent.trim():'';
-  if(baked){ try{ state=JSON.parse(baked); reseedUid(); applyPhones(state, phoneData()); return; }catch(e){} }
+  if(baked){ try{ state=JSON.parse(baked); if(!state.modules)state.modules=[]; if(!state.history)state.history=[]; reseedUid(); applyPhones(state, phoneData()); return; }catch(e){} }
   const saved = READONLY ? null : localStorage.getItem(LS_KEY);
   if(saved){
-    try{ state=JSON.parse(saved); reseedUid(); restructureRegions(state); applyFigmaMemos(state); applyMents(state); applyPhones(state, phoneData()); autoLink(state); return; }catch(e){}
+    try{ state=JSON.parse(saved); if(!state.modules)state.modules=[]; if(!state.history)state.history=[]; reseedUid(); restructureRegions(state); applyFigmaMemos(state); applyMents(state); applyPhones(state, phoneData()); autoLink(state); applyCommonModules(state); return; }catch(e){}
   }
   state = normalizeRaw(rawData(), alimData());
 }
@@ -12265,20 +12300,30 @@ function resetData(){
 
 /* ---------- tree helpers ---------- */
 function curService(){ return state.services.find(s=>s.id===curServiceId); }
+function modules(){ return state.modules||(state.modules=[]); }
+function findModule(id){ return modules().find(m=>m.id===id); }
+function ctxOwner(){ return ctxKind==='module' ? findModule(ctxModuleId) : curService(); }
+function ctxTree(){ const o=ctxOwner(); return o?o.tree:[]; }
+function effChildren(n){ if(n.moduleRef){ const m=findModule(n.moduleRef); return m?m.tree:[]; } return n.children; }
 function walk(nodes,fn,parent=null){ for(const n of nodes){ fn(n,parent,nodes); walk(n.children,fn,n);} }
-function findNode(id){ let res=null; for(const s of state.services){ walk(s.tree,(n)=>{if(n.id===id)res=n;}); if(res)return res;} return res; }
+function findNode(id){ let res=null;
+  const scan=t=>{ walk(t,(n)=>{if(n.id===id)res=n;}); };
+  for(const s of state.services){ scan(s.tree); if(res)return res; }
+  for(const m of modules()){ scan(m.tree); if(res)return res; }
+  return res; }
 function findParentList(serviceTree,id){ // returns {list, index, parent}
   let out=null;
   const rec=(list,parent)=>{ for(let i=0;i<list.length;i++){ if(list[i].id===id){out={list,index:i,parent};return;} rec(list[i].children,list[i]); if(out)return; } };
   rec(serviceTree,null); return out;
 }
-function leafCount(nodes){ let c=0; walk(nodes,(n)=>{ if(!n.children.length) c++; }); return c; }
+function moduleUsage(modId){ let c=0; state.services.forEach(s=>walk(s.tree,n=>{if(n.moduleRef===modId)c++;})); modules().forEach(m=>walk(m.tree,n=>{if(n.moduleRef===modId)c++;})); return c; }
+function leafCount(nodes){ let c=0; walk(nodes,(n)=>{ if(!effChildren(n).length) c++; }); return c; }
 function entryCount(nodes){ let c=0; walk(nodes,(n)=>{ c+=n.entries.length; }); return c; }
 
 /* ---------- render: sidebar ---------- */
 function renderSidebar(){
   const sb=$('#sidebar');
-  if(view==='tpl'||view==='val'||view==='lift'){
+  if(view==='tpl'||view==='val'||view==='lift'||view==='mod'||view==='hist'||(view==='viz'&&vizModuleId)){
     sb.style.display='none'; return;
   }
   sb.style.display='block';
@@ -12299,13 +12344,16 @@ function renderContent(){
   else if(view==='table'){ renderTableView(c); }
   else if(view==='viz'){ renderViz(c); }
   else if(view==='tpl'){ renderTemplates(c); }
+  else if(view==='mod'){ renderModules(c); }
   else if(view==='lift'){ renderLift(c); }
   else if(view==='val'){ renderValidation(c); }
+  else if(view==='hist'){ renderHistory(c); }
 }
 function renderAll(){ renderSidebar(); renderContent(); refreshValBadge(); }
 
 /* ---------- render: tree ---------- */
 function renderTreeView(c){
+  ctxKind='service'; ctxModuleId=null;
   const s=curService();
   if(!s){ c.innerHTML='<div class="treepane"><div class="insp-empty">왼쪽에서 서비스를 선택하세요.</div></div>'; return; }
   c.className='content'+(curNodeId?' has-sel':'');
@@ -12334,20 +12382,21 @@ function renderTreeView(c){
   renderInspector();
 }
 function renderTreeBody(){
-  const s=curService(); const tb=$('#treebody'); if(!tb||!s) return;
-  tb.innerHTML = s.tree.map(n=>nodeHtml(n,true)).join('') || '<div class="insp-empty">메뉴가 없습니다. “+ 최상위 메뉴”로 추가하세요.</div>';
+  const tb=$('#treebody'); const o=ctxOwner(); if(!tb||!o) return;
+  tb.innerHTML = o.tree.map(n=>nodeHtml(n,true)).join('') || '<div class="insp-empty">메뉴가 없습니다. “+ 최상위 메뉴”로 추가하세요.</div>';
 }
 function nodeHtml(n,isRoot){
   const open = n._collapsed!==true;
-  const hasKids=n.children.length>0;
+  const kids=effChildren(n); const hasKids=kids.length>0;
+  const mod=n.moduleRef?findModule(n.moduleRef):null;
   const mem=[...new Set(n.entries.map(e=>e.member).filter(Boolean))];
-  const acts=[...new Set(n.entries.map(e=>e.action).filter(Boolean))];
   let chips='';
+  if(n.branch) chips+=`<span class="chip" style="background:#fef0d8;color:#854f0b;border-color:#fac775" title="분기 조건">⑂ ${esc(n.branch)}</span>`;
   mem.forEach(m=>chips+=`<span class="chip mem">${esc(m)}</span>`);
   if(n.entries.length){ const ck=nodeCatKey(n); if(ck!=='none') chips+=`<span class="chip" style="background:${CAT[ck].bg};color:${CAT[ck].tx};border-color:${CAT[ck].bd}">${CAT[ck].label}</span>`; }
   if(n.ment) chips+=`<span class="chip" style="background:var(--amber-soft);color:var(--amber);border-color:#fac775" title="${esc(n.ment).slice(0,120)}">🔊</span>`;
-  // warn flag: leaf with no entries
-  if(!hasKids && n.entries.length===0) chips+=`<span class="chip warnflag">처리없음</span>`;
+  if(mod) chips+=`<span class="chip" style="background:var(--ok-soft);color:var(--ok);border-color:#9fe1cb">📦 ${esc(mod.name)}</span>`;
+  if(!hasKids && n.entries.length===0 && !mod) chips+=`<span class="chip warnflag">처리없음</span>`;
   let h=`<div class="node">
     <div class="node-row ${n.id===curNodeId?'sel':''}" onclick="selectNode('${n.id}')">
       <span class="twirl ${hasKids?'':'empty'}" onclick="event.stopPropagation();toggle('${n.id}')">${hasKids?(open?'▾':'▸'):''}</span>
@@ -12355,7 +12404,7 @@ function nodeHtml(n,isRoot){
       <span class="nlabel">${esc(n.label||'(이름없음)')}</span>
       <span class="chips">${chips}</span>
     </div>`;
-  if(hasKids && open){ h+=`<div class="children">`+n.children.map(c=>nodeHtml(c,false)).join('')+`</div>`; }
+  if(hasKids && open){ h+=`<div class="children"${mod?' style="opacity:.85"':''}>`+kids.map(c=>nodeHtml(c,false)).join('')+`</div>`; }
   h+=`</div>`;
   return h;
 }
@@ -12370,8 +12419,9 @@ function renderInspector(){
   const insp=$('#inspector'); if(!insp) return;
   const n=curNodeId?findNode(curNodeId):null;
   if(!n){ insp.innerHTML='<div class="insp-empty">노드를 선택하면<br>편집할 수 있습니다.</div>'; return; }
-  const loc=findParentList(curService().tree,n.id);
   const depthLabel=pathLabel(n.id);
+  const mod=n.moduleRef?findModule(n.moduleRef):null;
+  const BRANCHES=['','회원 구분','잔액 유무','휴대폰 인입 여부','카드 상태','상태코드(회원유형)','정책/시기(변동)','기타'];
   let h=`<div style="display:flex;justify-content:space-between;align-items:center"><p class="insp-title">메뉴 편집</p><button class="btn sm ghost" onclick="closeInspector()" title="닫기">✕</button></div><p class="insp-path">${esc(depthLabel)}</p>`;
   h+=`<div class="node-actions edit-only">
     <button class="btn sm" onclick="addChild('${n.id}')">+ 하위</button>
@@ -12385,18 +12435,35 @@ function renderInspector(){
       <div class="field"><label>DEPTH</label><input value="${esc(n.depth)}" placeholder="자동" onchange="setNodeField('${n.id}','depth',this.value)"></div>
     </div>`;
   h+=`<div class="field"><label>항목명</label><input value="${esc(n.label)}" onchange="setNodeField('${n.id}','label',this.value)"></div>`;
+  h+=`<div class="field"><label>⑂ 분기 조건 <span class="muted" style="font-weight:400">(이 메뉴에서 무엇으로 갈라지나)</span></label>
+      <select onchange="setNodeField('${n.id}','branch',this.value)">${BRANCHES.map(b=>`<option ${b===(n.branch||'')?'selected':''}>${b||'없음'}</option>`).join('')}</select></div>`;
   h+=`<div class="field"><label>🔊 IVR 멘트 (안내 음성)</label><textarea placeholder="이 메뉴에서 안내되는 음성 문구 (Figma 참고)" onchange="setNodeField('${n.id}','ment',this.value)">${esc(n.ment||'')}</textarea></div>`;
 
-  h+=`<div class="sec-title">처리 (엔드포인트 ${n.entries.length})</div>`;
-  n.entries.forEach((e,i)=>{ h+=entryHtml(n.id,e,i); });
-  h+=`<button class="btn sm edit-only" onclick="addEntry('${n.id}')" style="margin-top:4px">+ 처리 추가</button>`;
-  if(n.children.length){ h+=`<div class="hint" style="margin-top:14px">하위 메뉴 ${n.children.length}개가 있습니다. 보통 ‘처리’는 말단 메뉴에만 둡니다.</div>`; }
+  if(mod){
+    h+=`<div class="sec-title">📦 연결된 공통 IVR</div>
+      <div class="entry-card" style="border-color:#9fe1cb">
+        <div style="font-weight:600;margin-bottom:4px">${esc(mod.name)}</div>
+        <div class="muted" style="font-size:11.5px;margin-bottom:8px">${esc(mod.desc||'')} · 하위 ${mod.tree.length}개 흐름 (여기서는 읽기 전용, 공통 IVR에서 수정하면 사용하는 모든 곳에 반영)</div>
+        <button class="btn sm edit-only" onclick="editModule('${mod.id}')">공통 IVR 편집으로 이동</button>
+        <button class="btn sm ghost danger edit-only" onclick="detachModule('${n.id}')">참조 해제</button>
+      </div>`;
+  } else {
+    h+=`<div class="sec-title">처리 (엔드포인트 ${n.entries.length})</div>`;
+    n.entries.forEach((e,i)=>{ h+=entryHtml(n.id,e,i); });
+    h+=`<button class="btn sm edit-only" onclick="addEntry('${n.id}')" style="margin-top:4px">+ 처리 추가</button>`;
+    h+=`<div class="sec-title edit-only">📦 공통 IVR</div>
+      <div class="node-actions edit-only">
+        <button class="btn sm" onclick="insertModuleRef('${n.id}')">+ 공통 IVR 삽입(하위)</button>
+        ${n.children.length?`<button class="btn sm" onclick="extractModule('${n.id}')">이 흐름을 공통 IVR로 추출</button>`:''}
+      </div>`;
+  }
   insp.innerHTML=h;
 }
 function entryHtml(nodeId,e,i){
   const acts=["안내멘트 → 알림톡 → 앱","안내멘트 → 알림톡 → 챗봇 / 앱","카드 ARS → 알림톡 → 앱","카드 ARS → 알림톡 → 챗봇","상담원 연결","상담원 연결 → 알림톡 → 앱","안내멘트 → 알림톡 발송 → FAQ","안내멘트 → 알림톡"];
   const opts=['',...new Set([e.action,...acts].filter(Boolean))].map(a=>`<option ${a===e.action?'selected':''}>${esc(a)}</option>`).join('');
-  const profs=(curService().profiles||[]);
+  const svc=(ctxKind==='service')?curService():null;
+  const profs=(svc&&svc.profiles)||[];
   const profT=state.templates.filter(t=>profs.includes(t.profile));
   const linked=state.templates.find(t=>t.id===e.templateId);
   const tplOpts=`<option value="">(연결 안함)</option>`+profT.map(t=>`<option value="${t.id}" ${e.templateId===t.id?'selected':''}>${esc((t.code?t.code+' · ':'')+stripIvr(t.name||t.ivrNo))}</option>`).join('')
@@ -12411,6 +12478,7 @@ function entryHtml(nodeId,e,i){
       <div class="field"><label>Action</label>
         <select onchange="setEntry('${nodeId}','${e.id}','action',this.value)" onkeydown="if(event.key==='Enter')this.blur()">${opts}</select></div>
     </div>
+    <div class="field"><label>분기 조건값 <span class="muted" style="font-weight:400">(이 처리가 적용되는 조건)</span></label><input value="${esc(e.cond||'')}" placeholder="예: 잔액 있음 / 휴대폰 인입됨 / 상태코드 2(비회원)" onchange="setEntry('${nodeId}','${e.id}','cond',this.value)"></div>
     <div class="field"><label>Action(직접입력)</label><input value="${esc(e.action)}" onchange="setEntry('${nodeId}','${e.id}','action',this.value)"></div>
     <div class="field"><label>실행 상세</label><textarea onchange="setEntry('${nodeId}','${e.id}','detail',this.value)">${esc(e.detail)}</textarea></div>
     <div class="field"><label>알림톡 템플릿 ${profs.length?'':'<span style="color:var(--warn)">— 서비스에 업체 매핑 필요</span>'}</label><select onchange="setEntry('${nodeId}','${e.id}','templateId',this.value)">${tplOpts}</select></div>
@@ -12423,9 +12491,9 @@ function entryHtml(nodeId,e,i){
   </div>`;
 }
 function pathLabel(id){
-  const s=curService(); let chain=[];
+  const o=ctxOwner(); if(!o)return ''; let chain=[];
   const rec=(list,acc)=>{ for(const n of list){ const a=[...acc,`${n.num} ${n.label}`]; if(n.id===id){chain=a;return true;} if(rec(n.children,a))return true; } return false; };
-  rec(s.tree,[s.name]); return chain.join('  ›  ');
+  rec(o.tree,[o.name||'공통 IVR']); return chain.join('  ›  ');
 }
 
 /* ---------- edits ---------- */
@@ -12433,48 +12501,134 @@ function setSvcField(f,v){ curService()[f]=v; if(f==='name')renderSidebar(); sav
 function allProfiles(){ return [...new Set(state.templates.map(t=>t.profile).filter(Boolean))].sort(); }
 function addProfile(p){ if(!p)return; const s=curService(); if(!s.profiles)s.profiles=[]; if(!s.profiles.includes(p))s.profiles.push(p); renderTreeView($('#content')); save(); }
 function rmProfile(p){ const s=curService(); s.profiles=(s.profiles||[]).filter(x=>x!==p); renderTreeView($('#content')); save(); }
-function setNodeField(id,f,v){ findNode(id)[f]=v; renderTreeBody(); save(); }
+function setNodeField(id,f,v){ findNode(id)[f]=v; renderTreeBody(); renderInspector(); save(); refreshValBadge(); }
 function setEntry(nodeId,eid,f,v){ const n=findNode(nodeId); const e=n.entries.find(x=>x.id===eid); e[f]=v;
   if(f==='templateId'){ const t=state.templates.find(x=>x.id===v); const u=tplUrl(t); if(u) e.url=u; }
   renderTreeBody(); renderInspector(); save(); refreshValBadge(); }
-function addEntry(id){ findNode(id).entries.push({id:uid(),member:'전체',action:'',detail:'',url:'',note:'',templateId:''}); renderInspector(); renderTreeBody(); save(); }
+function addEntry(id){ findNode(id).entries.push({id:uid(),member:'전체',cond:'',action:'',detail:'',url:'',note:'',templateId:''}); renderInspector(); renderTreeBody(); save(); }
 function delEntry(nodeId,eid){ const n=findNode(nodeId); n.entries=n.entries.filter(e=>e.id!==eid); renderInspector(); renderTreeBody(); save(); }
-function newNode(){ return {id:uid(),num:'',label:'새 메뉴',depth:'',entries:[],children:[]}; }
-function addChild(id){ const n=findNode(id); const c=newNode(); c.num=String(n.children.length+1); n.children.push(c); n._collapsed=false; curNodeId=c.id; renderTreeBody(); renderInspector(); save(); }
-function addSibling(id){ const loc=findParentList(curService().tree,id); const c=newNode(); c.num=String(loc.list.length+1); loc.list.splice(loc.index+1,0,c); curNodeId=c.id; renderTreeBody(); renderInspector(); save(); }
-function addRoot(){ const c=newNode(); c.num=String(curService().tree.length+1); curService().tree.push(c); curNodeId=c.id; renderTreeBody(); renderInspector(); save(); }
+function newNode(){ return {id:uid(),num:'',label:'새 메뉴',depth:'',ment:'',branch:'',entries:[],children:[]}; }
+function addChild(id){ const n=findNode(id); if(n.moduleRef){toast('공통 IVR 참조 노드에는 하위를 추가할 수 없습니다. 공통 IVR을 편집하세요.');return;} const c=newNode(); c.num=String(n.children.length+1); n.children.push(c); n._collapsed=false; curNodeId=c.id; renderTreeBody(); renderInspector(); save(); }
+function addSibling(id){ const loc=findParentList(ctxTree(),id); if(!loc)return; const c=newNode(); c.num=String(loc.list.length+1); loc.list.splice(loc.index+1,0,c); curNodeId=c.id; renderTreeBody(); renderInspector(); save(); }
+function addRoot(){ const c=newNode(); c.num=String(ctxTree().length+1); ctxTree().push(c); curNodeId=c.id; renderTreeBody(); renderInspector(); save(); }
 function deleteNode(id){ const n=findNode(id); const kids=n.children.length, ents=n.entries.length;
-  if((kids||ents) && !confirm(`‘${n.label}’ 및 하위/처리(${kids}개 하위, ${ents}개 처리)를 삭제할까요?`)) return;
-  const loc=findParentList(curService().tree,id); loc.list.splice(loc.index,1); curNodeId=null; $('#content').classList.remove('has-sel'); renderTreeBody(); renderInspector(); save(); refreshValBadge(); }
-function moveNode(id,dir){ const loc=findParentList(curService().tree,id); const j=loc.index+dir; if(j<0||j>=loc.list.length)return; const t=loc.list[loc.index]; loc.list[loc.index]=loc.list[j]; loc.list[j]=t; renderTreeBody(); save(); }
+  if((kids||ents||n.moduleRef) && !confirm(`‘${n.label}’ 및 하위/처리를 삭제할까요?`)) return;
+  const loc=findParentList(ctxTree(),id); if(!loc)return; loc.list.splice(loc.index,1); curNodeId=null; $('#content').classList.remove('has-sel'); renderTreeBody(); renderInspector(); save(); refreshValBadge(); }
+function moveNode(id,dir){ const loc=findParentList(ctxTree(),id); if(!loc)return; const j=loc.index+dir; if(j<0||j>=loc.list.length)return; const t=loc.list[loc.index]; loc.list[loc.index]=loc.list[j]; loc.list[j]=t; renderTreeBody(); save(); }
 function addService(){ const name=prompt('새 서비스 이름','새 서비스'); if(!name)return; const s={id:uid(),name,sheet:name,file:'(신규)',phone:'',note:'',tree:[]}; state.services.push(s); curServiceId=s.id; curNodeId=null; renderAll(); save(); }
 function deleteService(){ if(!confirm(`서비스 ‘${curService().name}’ 전체를 삭제할까요?`))return; state.services=state.services.filter(s=>s.id!==curServiceId); curServiceId=state.services[0]?.id||null; curNodeId=null; renderAll(); save(); }
+
+/* ---------- modules (reusable flows) ---------- */
+let modEditId=null;
+function cloneNodes(arr){ const c=JSON.parse(JSON.stringify(arr)); (function w(l){ for(const n of l){ n.id=uid(); (n.entries||[]).forEach(e=>e.id=uid()); w(n.children||[]); } })(c); return c; }
+function createModule(name,treeNodes,desc){ const m={id:uid(),name:name||'새 공통 IVR',desc:desc||'',tree:treeNodes||[]}; modules().push(m); return m; }
+function setModuleField(f,v){ const m=findModule(modEditId); if(m){ m[f]=v; save(); } }
+function newModulePrompt(){ const name=prompt('새 공통 IVR 이름','새 공통 IVR'); if(!name)return; const m=createModule(name,[],''); save(); modEditId=m.id; renderModules($('#content')); }
+function editModuleFromList(id){ modEditId=id; curNodeId=null; renderModules($('#content')); }
+function editModule(id){ modEditId=id; curNodeId=null; setView('mod'); }
+function exitModuleEdit(){ modEditId=null; ctxKind='service'; ctxModuleId=null; curNodeId=null; renderModules($('#content')); }
+function deleteModule(id){ const u=moduleUsage(id); if(u && !confirm(`${u}곳에서 사용 중입니다. 삭제하면 그 참조가 끊깁니다. 계속할까요?`))return; if(!u && !confirm('이 공통 IVR을 삭제할까요?'))return;
+  state.modules=modules().filter(m=>m.id!==id);
+  const clr=t=>walk(t,n=>{ if(n.moduleRef===id){ n.moduleRef=''; } });
+  state.services.forEach(s=>clr(s.tree)); modules().forEach(m=>clr(m.tree));
+  if(modEditId===id)modEditId=null; renderModules($('#content')); save(); }
+function extractModule(nodeId){ const n=findNode(nodeId); if(!n.children.length){toast('하위 흐름이 있어야 공통 IVR로 추출됩니다');return;}
+  const name=prompt('공통 IVR 이름을 입력하세요',n.label||'공통 IVR'); if(!name)return;
+  const owner=ctxOwner(); const m=createModule(name,n.children,(owner?owner.name:'')+' › '+n.label);
+  n.children=[]; n.moduleRef=m.id; renderTreeBody(); renderInspector(); save(); toast(`‘${name}’ 공통 IVR로 추출했습니다`); }
+function insertModuleRef(parentId){ if(!modules().length){ toast('먼저 공통 IVR을 만들거나 다른 메뉴에서 공통 IVR로 추출하세요'); return; }
+  const pick=prompt('삽입할 공통 IVR 번호:\n'+modules().map((m,i)=>`${i+1}. ${m.name}`).join('\n')); const m=modules()[parseInt(pick,10)-1]; if(!m)return;
+  const p=findNode(parentId); const c=newNode(); c.label=m.name; c.num=String(p.children.length+1); c.moduleRef=m.id; c.entries=[]; c.children=[];
+  p.children.push(c); p._collapsed=false; curNodeId=c.id; renderTreeBody(); renderInspector(); save(); toast('공통 IVR 참조를 추가했습니다'); }
+function detachModule(nodeId){ if(!confirm('참조를 해제하고 현재 공통 IVR 내용을 이 노드에 독립 복사할까요?'))return; const n=findNode(nodeId); const m=findModule(n.moduleRef); n.children=cloneNodes(m?m.tree:[]); n.moduleRef=''; renderTreeBody(); renderInspector(); save(); toast('참조 해제 후 복사했습니다'); }
+function renderModules(c){
+  if(modEditId){ renderModuleEditor(c); return; }
+  ctxKind='service'; ctxModuleId=null;
+  c.className='content';
+  c.innerHTML=`<div class="valpane">
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
+      <b style="font-size:15px">공통 IVR (${modules().length})</b>
+      <span class="muted" style="font-size:12px">여러 서비스가 함께 쓰는 공통 흐름. 공통 IVR을 고치면 사용하는 모든 곳에 반영됩니다.</span>
+      <div class="spacer" style="flex:1"></div>
+      <button class="btn sm primary edit-only" onclick="newModulePrompt()">+ 새 공통 IVR</button>
+    </div>
+    <div class="hint" style="max-width:920px">‘구조트리상세’에서 메뉴를 선택해 <b>이 흐름을 공통 IVR로 추출</b>하거나, <b>+ 공통 IVR 삽입(하위)</b>으로 기존 공통 IVR을 가져다 쓸 수 있습니다.</div>
+    ${modules().length? modules().map(m=>`
+      <div class="tpl-card" style="max-width:920px">
+        <div class="thead"><span class="tname">📦 ${esc(m.name)}</span>
+          <span class="count-pill pill-info">사용 ${moduleUsage(m.id)}곳</span>
+          <div class="spacer" style="flex:1"></div>
+          <button class="btn sm" onclick="toggleModStruct('${m.id}')">${modExpanded.has(m.id)?'▾ 구조 접기':'▸ 구조 보기'}</button>
+          <button class="btn sm" onclick="viewModuleDiagram('${m.id}')">다이어그램</button>
+          <button class="btn sm edit-only" onclick="editModuleFromList('${m.id}')">편집</button>
+          <button class="btn sm ghost danger edit-only" onclick="deleteModule('${m.id}')">삭제</button>
+        </div>
+        <div class="muted" style="font-size:12px">${esc(m.desc||'')} · 흐름 ${m.tree.length}개</div>
+        ${modExpanded.has(m.id)?`<div style="margin-top:8px;border-top:1px solid var(--line2);padding-top:8px">${moduleStructHtml(m.tree,0)}</div>`:''}
+      </div>`).join('') : '<div class="insp-empty">아직 공통 IVR이 없습니다. 구조트리상세에서 공통 흐름을 공통 IVR로 추출해 보세요.</div>'}
+  </div>`;
+}
+const modExpanded=new Set();
+function toggleModStruct(id){ if(modExpanded.has(id))modExpanded.delete(id); else modExpanded.add(id); renderModules($('#content')); }
+function viewModuleDiagram(id){ vizModuleId=id; setView('viz'); }
+function moduleStructHtml(nodes,depth){
+  return (nodes||[]).map(n=>{
+    const kids=effChildren(n); const ck=nodeCatKey(n);
+    const cat=(n.entries.length&&ck!=='none')?`<span class="chip" style="background:${CAT[ck].bg};color:${CAT[ck].tx};border-color:${CAT[ck].bd}">${CAT[ck].label}</span>`:'';
+    const mem=[...new Set(n.entries.map(e=>e.member).filter(Boolean))].map(x=>`<span class="chip mem">${esc(x)}</span>`).join('');
+    const br=n.branch?`<span class="chip" style="background:#fef0d8;color:#854f0b;border-color:#fac775">⑂ ${esc(n.branch)}</span>`:'';
+    const sub=findModule(n.moduleRef);
+    return `<div style="display:flex;align-items:center;gap:6px;padding:3px 0;padding-left:${depth*20}px">
+        <span class="keycap" style="background:${depth===0?'var(--accent)':'var(--text)'}">${esc(n.num||'·')}</span>
+        <span style="font-size:12.5px">${esc(n.label||'(이름없음)')}</span>${br}${mem}${cat}
+        ${sub?`<span class="chip" style="background:var(--ok-soft);color:var(--ok);border-color:#9fe1cb">📦 ${esc(sub.name)}</span>`:''}
+      </div>`+(kids.length&&!n.moduleRef?moduleStructHtml(kids,depth+1):'');
+}).join('');
+}
+function renderModuleEditor(c){
+  const m=findModule(modEditId); if(!m){ modEditId=null; renderModules(c); return; }
+  ctxKind='module'; ctxModuleId=m.id;
+  c.className='content'+(curNodeId?' has-sel':'');
+  c.innerHTML=`<div class="treepane" id="treepane"></div><div class="inspector" id="inspector"></div>`;
+  $('#treepane').innerHTML=`<div class="svc-head">
+      <button class="btn sm" onclick="exitModuleEdit()">← 공통 IVR 목록</button>
+      <span class="keycap root">📦</span>
+      <input id="svcName" value="${esc(m.name)}" style="font-size:15px;font-weight:600;border:1px solid transparent;padding:3px 6px;border-radius:6px;width:200px" onchange="setModuleField('name',this.value)">
+      <input value="${esc(m.desc||'')}" placeholder="설명" style="font-size:12px;border:1px solid var(--line);padding:3px 8px;border-radius:6px;width:220px" onchange="setModuleField('desc',this.value)">
+      <span class="ph">사용 ${moduleUsage(m.id)}곳 · 흐름 ${m.tree.length}</span>
+      <div class="spacer"></div>
+      <button class="btn sm edit-only" onclick="addRoot()">+ 흐름 추가</button>
+    </div><div id="treebody"></div>`;
+  renderTreeBody(); renderInspector();
+}
 
 /* ---------- table view ---------- */
 function flatten(service){
   const rows=[];
-  const rec=(list,path)=>{ for(const n of list){ const p=[...path,{num:n.num,label:n.label}];
+  const rec=(list,path)=>{ for(const n of list){ const p=[...path,{num:n.num,label:n.label}]; const kids=effChildren(n);
     if(n.entries.length){ n.entries.forEach(e=>rows.push({path:p,e,node:n})); }
-    else if(!n.children.length){ rows.push({path:p,e:null,node:n}); }
-    rec(n.children,p); } };
+    else if(!kids.length){ rows.push({path:p,e:null,node:n}); }
+    rec(kids,p); } };
   rec(service.tree,[]); return rows;
 }
-function maxDepth(service){ let m=0; const rec=(l,d)=>{ for(const n of l){ m=Math.max(m,d); rec(n.children,d+1);} }; rec(service.tree,1); return m; }
+function maxDepth(service){ let m=0; const rec=(l,d)=>{ for(const n of l){ m=Math.max(m,d); rec(effChildren(n),d+1);} }; rec(service.tree,1); return m; }
 function renderTableView(c){
   const s=curService();
   if(!s){ c.innerHTML='<div class="treepane"><div class="insp-empty">서비스를 선택하세요.</div></div>'; return; }
   const md=Math.max(maxDepth(s),1); const rows=flatten(s);
   let head='';
   for(let d=1;d<=md;d++) head+=`<th>${d}D 번호</th><th>${d}D 항목</th>`;
-  head+='<th>멘트</th><th>회원</th><th>Action</th><th>실행 상세</th><th>템플릿코드</th><th>URL</th>';
+  head+='<th>분기조건</th><th>멘트</th><th>회원</th><th>조건값</th><th>Action</th><th>실행 상세</th><th>템플릿코드</th><th>URL</th>';
   let body='';
   for(const r of rows){
     let tds='';
     for(let d=1;d<=md;d++){ const seg=r.path[d-1]; tds+=`<td class="nowrap ${seg?'':'dim'}">${seg?esc(seg.num):''}</td><td class="${seg?'':'dim'}">${seg?esc(seg.label):''}</td>`; }
     const e=r.e;
     const tpl=e&&e.templateId?state.templates.find(t=>t.id===e.templateId):null;
-    tds+=`<td class="dim" style="max-width:170px">${esc((r.node.ment||'').slice(0,50))}</td>
+    tds+=`<td class="nowrap dim">${esc(r.node.branch||'')}</td>
+      <td class="dim" style="max-width:160px">${esc((r.node.ment||'').slice(0,40))}</td>
       <td class="nowrap">${e?esc(e.member):'<span class="dim">처리없음</span>'}</td>
+      <td class="dim nowrap">${e?esc(e.cond||''):''}</td>
       <td>${e?esc(e.action):''}</td>
       <td class="dim">${e?esc((e.detail||'').slice(0,60)):''}</td>
       <td class="nowrap">${tpl?esc(tpl.code||stripIvr(tpl.name)):'<span class="dim">미지정</span>'}</td>
@@ -12495,47 +12649,51 @@ const CAT={
 function actCatKey(action){ const a=action||''; if(/상담원/.test(a))return 'agent'; if(/ARS|API/.test(a))return 'api'; if(/알림톡/.test(a))return 'talk'; return ''; }
 function nodeCatKey(n){ const ks=n.entries.map(e=>actCatKey(e.action)).filter(Boolean);
   if(ks.includes('agent'))return 'agent'; if(ks.includes('api'))return 'api'; if(ks.includes('talk'))return 'talk'; return 'none'; }
-function vizColor(n){ if(n.children.length && !n.entries.length) return CAT.none; return CAT[nodeCatKey(n)]; }
+function vizColor(n){ if(effChildren(n).length && !n.entries.length) return CAT.none; return CAT[nodeCatKey(n)]; }
+let vizModuleId=null;
 function renderViz(c){
-  const s=curService();
-  if(!s){ c.innerHTML='<div class="treepane"><div class="insp-empty">왼쪽에서 서비스를 선택하세요.</div></div>'; return; }
+  const isMod=!!vizModuleId;
+  const s=isMod?findModule(vizModuleId):curService();
+  if(!s){ if(isMod){vizModuleId=null;} c.innerHTML='<div class="treepane"><div class="insp-empty">'+(isMod?'공통 IVR을 찾을 수 없습니다.':'왼쪽에서 서비스를 선택하세요.')+'</div></div>'; return; }
   const ROWH=66,BOXH=54,BOXW=224,COLW=266,PADX=24,PADY=24;
   let yc=0; const nodes=[];
   function layout(n,depth,prefix){
     n.__code = prefix ? prefix+'-'+(n.num||'?') : (n.num||'?');
-    let y; const collapsed=n._collapsed===true;
-    if(collapsed || !n.children.length){ y=yc; yc+=ROWH; }
-    else { const ys=n.children.map(ch=>layout(ch,depth+1,n.__code)); y=(ys[0]+ys[ys.length-1])/2; }
+    const kids=effChildren(n); let y; const collapsed=n._collapsed===true;
+    if(collapsed || !kids.length){ y=yc; yc+=ROWH; }
+    else { const ys=kids.map(ch=>layout(ch,depth+1,n.__code)); y=(ys[0]+ys[ys.length-1])/2; }
     n.__x=PADX+depth*COLW; n.__y=PADY+y; nodes.push(n); return y;
   }
   s.tree.forEach(r=>layout(r,0,''));
   const md=Math.max(maxDepth(s),1);
   const W=PADX*2+(md-1)*COLW+BOXW, H=PADY*2+Math.max(yc,ROWH);
   let edges='';
-  nodes.forEach(n=>{ if(n._collapsed!==true){ n.children.forEach(ch=>{
+  nodes.forEach(n=>{ if(n._collapsed!==true){ effChildren(n).forEach(ch=>{
     const x1=n.__x+BOXW,y1=n.__y+BOXH/2,x2=ch.__x,y2=ch.__y+BOXH/2,mx=(x1+x2)/2;
     edges+=`<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}" fill="none" stroke="#cdd2da" stroke-width="1.5"/>`;
   }); } });
   let boxes='';
   nodes.forEach(n=>{
-    const col=vizColor(n), hasKids=n.children.length>0, collapsed=n._collapsed===true;
+    const kids=effChildren(n); const col=vizColor(n), hasKids=kids.length>0, collapsed=n._collapsed===true;
+    const mod=n.moduleRef?findModule(n.moduleRef):null;
     const mem=[...new Set(n.entries.map(e=>e.member).filter(Boolean))];
-    const ck=nodeCatKey(n); const catTxt=hasKids&&!n.entries.length?(collapsed?'▸ 펼치기':n.children.length+'개 하위'):(CAT[ck].label||'');
-    const lbl=esc((n.label||'').length>18?n.label.slice(0,17)+'…':(n.label||'(이름없음)'));
+    const ck=nodeCatKey(n); const catTxt=mod?('📦 '+mod.name):(hasKids&&!n.entries.length?(collapsed?'▸ 펼치기':kids.length+'개 하위'):(CAT[ck].label||''));
+    const lbl=esc((n.branch?'⑂ ':'')+((n.label||'').length>17?n.label.slice(0,16)+'…':(n.label||'(이름없음)')));
     boxes+=`<g style="cursor:pointer" onclick="vizToggle('${n.id}')">
-      <rect x="${n.__x}" y="${n.__y}" width="${BOXW}" height="${BOXH}" rx="9" fill="${col.bg}" stroke="${col.bd}" stroke-width="1.5"/>
-      <rect x="${n.__x}" y="${n.__y}" width="5" height="${BOXH}" rx="2.5" fill="${col.bd}"/>
+      <rect x="${n.__x}" y="${n.__y}" width="${BOXW}" height="${BOXH}" rx="9" fill="${col.bg}" stroke="${mod?'#1d9e75':col.bd}" stroke-width="1.5"${mod?' stroke-dasharray="4 2"':''}/>
+      <rect x="${n.__x}" y="${n.__y}" width="5" height="${BOXH}" rx="2.5" fill="${mod?'#1d9e75':col.bd}"/>
       <text x="${n.__x+14}" y="${n.__y+16}" font-size="10" font-weight="600" fill="#8a8f98">IVR ${esc(n.__code)}</text>
       <text x="${n.__x+14}" y="${n.__y+33}" font-size="12.5" font-weight="600" fill="${col.tx}">${lbl}</text>
       <text x="${n.__x+14}" y="${n.__y+48}" font-size="10" fill="#6b7280">${esc(catTxt)}${mem.length?'  ['+esc(mem.join('/'))+']':''}</text>
       ${n.ment?`<text x="${n.__x+BOXW-(hasKids?24:11)}" y="${n.__y+16}" text-anchor="end" font-size="11">🔊</text>`:''}
-      ${hasKids?`<circle cx="${n.__x+BOXW}" cy="${n.__y+BOXH/2}" r="8" fill="#fff" stroke="${col.bd}" stroke-width="1.5"/><text x="${n.__x+BOXW}" y="${n.__y+BOXH/2+4}" text-anchor="middle" font-size="13" fill="${col.bd}">${collapsed?'+':'–'}</text>`:''}
+      ${hasKids?`<circle cx="${n.__x+BOXW}" cy="${n.__y+BOXH/2}" r="8" fill="#fff" stroke="${mod?'#1d9e75':col.bd}" stroke-width="1.5"/><text x="${n.__x+BOXW}" y="${n.__y+BOXH/2+4}" text-anchor="middle" font-size="13" fill="${mod?'#1d9e75':col.bd}">${collapsed?'+':'–'}</text>`:''}
     </g>`;
   });
   c.innerHTML=`<div class="treepane" style="padding:0">
     <div style="padding:12px 18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;border-bottom:1px solid var(--line2)">
-      <b style="font-size:15px">${esc(s.name)}</b><span class="muted" style="font-size:12px">${esc(s.phone||'')}</span>
-      <span class="ph" style="font-size:11px">박스의 'IVR n-n'은 누르는 번호 경로 · 노드 클릭=펼치기/접기</span>
+      ${isMod?`<button class="btn sm" onclick="vizModuleId=null;setView('mod')">← 공통 IVR 목록</button>`:''}
+      <b style="font-size:15px">${isMod?'📦 ':''}${esc(s.name)}</b>${isMod?`<span class="muted" style="font-size:12px">${esc(s.desc||'')} · 사용 ${moduleUsage(s.id)}곳</span>`:`<span class="muted" style="font-size:12px">${esc(s.phone||'')}</span>`}
+      <span class="ph" style="font-size:11px">${isMod?'공통 IVR 흐름 구조 · 노드 클릭=펼치기/접기':"박스의 'IVR n-n'은 누르는 번호 경로 · 노드 클릭=펼치기/접기"}</span>
       <div class="spacer" style="flex:1"></div>
       <span class="chip" style="background:${CAT.agent.bg};color:${CAT.agent.tx};border-color:${CAT.agent.bd}">${CAT.agent.label}</span>
       <span class="chip" style="background:${CAT.talk.bg};color:${CAT.talk.tx};border-color:${CAT.talk.bd}">${CAT.talk.label}</span>
@@ -12544,7 +12702,7 @@ function renderViz(c){
     <div style="overflow:auto;padding:10px"><svg width="${W}" height="${H}" style="display:block">${edges}${boxes}</svg></div>
   </div>`;
 }
-function vizToggle(id){ const n=findNode(id); if(n&&n.children.length){ n._collapsed=!(n._collapsed===true); renderViz($('#content')); } }
+function vizToggle(id){ const n=findNode(id); if(n&&effChildren(n).length){ n._collapsed=!(n._collapsed===true); renderViz($('#content')); } }
 
 /* ---------- templates ---------- */
 let tplFilterProfile=''; let tplSearch='';
@@ -12628,13 +12786,14 @@ function renderLift(c){
 function buildLiftRows(s, profile){
   const rows=[]; const profT=state.templates.filter(t=>t.profile===profile);
   const byId=id=>state.templates.find(t=>t.id===id);
-  for(const lp of leafPaths(s.tree)){
+  for(const lp of leafPathsEff(s.tree)){
     const entries=lp.node.entries.length?lp.node.entries:[null];
     for(const e of entries){
       let code='', tid='';
       if(e&&e.templateId){ const t=byId(e.templateId);
         if(t){ if(t.profile===profile){ code=t.code; tid=t.id; }
           else { const sib=profT.find(x=>x.ivrNo===t.ivrNo); if(sib){ code=sib.code; tid=sib.id; } } } }
+      if(!code){ const bt=bestTemplate(profT, lp.menu, lp.sub, lp.node.label); if(bt){ code=bt.code; tid=bt.id; } }
       rows.push({menu:lp.menu||lp.node.label, sub:lp.sub||'', code, tid, member:e?e.member:'', nodeId:lp.node.id, entryId:e?e.id:''});
     }
   }
@@ -12690,9 +12849,10 @@ function validate(){
     checkDup(s.tree,'');
     walk(s.tree,(n)=>{
       const path=`${s.name} › ${n.num} ${n.label}`;
-      if(!n.children.length && n.entries.length===0)
+      if(n.moduleRef) return;
+      if(!effChildren(n).length && n.entries.length===0)
         issues.push({level:'err',msg:`말단 메뉴에 처리(Action)가 없음: ‘${n.label}’`,loc:s.name,serviceId:s.id,nodeId:n.id});
-      if(n.children.length===0 && !n.label)
+      if(effChildren(n).length===0 && !n.label)
         issues.push({level:'warn',msg:`항목명이 비어있는 말단 메뉴`,loc:s.name,serviceId:s.id,nodeId:n.id});
       n.entries.forEach(e=>{
         if(!e.action) issues.push({level:'err',msg:`Action 비어있음 (${e.member||'전체'})`,loc:path,serviceId:s.id,nodeId:n.id});
@@ -12779,16 +12939,61 @@ function runBulk(){
 /* ---------- export ---------- */
 function dl(name,content,type){ const b=new Blob([content],{type}); const u=URL.createObjectURL(b); const a=document.createElement('a'); a.href=u; a.download=name; a.click(); URL.revokeObjectURL(u); }
 function exportJSON(){ dl('ivr_backup_'+stamp()+'.json', JSON.stringify(state,null,2),'application/json'); toast('JSON 백업을 내려받았습니다'); }
-async function exportViewer(){
+/* ---------- 이력관리 + 발행 ---------- */
+function countStats(st){ let nodes=0,entries=0; const cnt=t=>walk(t,n=>{nodes++;entries+=n.entries.length;});
+  st.services.forEach(s=>cnt(s.tree)); (st.modules||[]).forEach(m=>cnt(m.tree));
+  return {services:st.services.length, nodes, entries, templates:st.templates.length, modules:(st.modules||[]).length}; }
+function addHistory(editor,note){ const h=state.history||(state.history=[]); h.push({id:uid(),ts:new Date().toISOString(),ver:h.length+1,editor:editor||'(미입력)',note:note||'(내용 미입력)',counts:countStats(state)}); save(); }
+function lastEditor(){ try{ return localStorage.getItem('ivr_last_editor')||''; }catch(e){ return ''; } }
+function openPublish(){ if(READONLY)return;
+  showModal(`<h2>📤 공유본 발행</h2>
+    <div class="hint">발행하면 ① 이력관리에 버전·변경내용이 기록되고 ② 현재 내용이 담긴 읽기전용 공유본 HTML이 다운로드됩니다. 그 파일을 호스팅에 올리면 도메인 사용자가 최신본과 이력을 봅니다.</div>
+    <div class="mrow"><label>편집자</label><input id="pEditor" value="${esc(lastEditor())}" placeholder="이름"></div>
+    <div class="mrow"><label>변경 내용</label><input id="pNote" placeholder="예: 고유가 메뉴 추가, 잔액조회 멘트 수정"></div>
+    <div class="mfoot"><button class="btn" onclick="closeModal()">취소</button><button class="btn primary" onclick="doPublish()">발행 + 다운로드</button></div>`);
+  setTimeout(()=>{ const el=$('#pNote'); if(el)el.focus(); },50);
+}
+function doPublish(){ const editor=($('#pEditor').value||'').trim(); const note=($('#pNote').value||'').trim();
+  try{ localStorage.setItem('ivr_last_editor',editor); }catch(e){}
+  addHistory(editor,note); closeModal(); exportViewerFile(); }
+async function exportViewerFile(){
   let src;
   try{ const r=await fetch(location.href,{cache:'no-store'}); src=await r.text(); }
-  catch(e){ alert('‘공유본 내보내기’는 미리보기/웹서버로 열었을 때만 동작합니다.\n로컬 더블클릭(file://)이라면 동봉된 server.js로 실행하거나, 백업(JSON)으로 내보낸 뒤 재빌드하세요.'); return; }
+  catch(e){ alert('발행(공유본 생성)은 미리보기/웹서버로 열었을 때만 동작합니다.\n로컬 더블클릭(file://)이면 동봉 server.js로 실행하거나 백업(JSON) 후 재빌드하세요.\n(이력은 이미 기록되었습니다)'); return; }
   src=src.replace(/const READONLY = false;/, 'const READONLY = true;');
   const sj=JSON.stringify(state).replace(/<\/script>/gi,'<\\/script>');
   src=src.replace(/(<script id="bakedstate" type="application\/json">)[\s\S]*?(<\/script>)/, '$1'+sj+'$2');
-  if(!/const READONLY = true;/.test(src) || src.indexOf(sj)<0){ alert('내보내기 처리에 실패했습니다.'); return; }
+  if(!/const READONLY = true;/.test(src) || src.indexOf(sj)<0){ alert('발행 처리에 실패했습니다.'); return; }
   dl('IVR_대시보드_공유.html', src, 'text/html;charset=utf-8');
-  toast('현재 내용이 반영된 읽기전용 공유본을 내려받았습니다');
+  toast('발행 완료 — 공유본을 내려받았습니다. 호스팅에 올리세요');
+}
+function fmtTs(iso){ try{ const d=new Date(iso); const p=x=>String(x).padStart(2,'0'); return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; }catch(e){ return iso; } }
+function histDelta(c,prev){ if(!c) return ''; if(!prev) return `서비스 ${c.services} · 메뉴 ${c.nodes} · 처리 ${c.entries} · 템플릿 ${c.templates} · 공통 IVR ${c.modules}`;
+  const parts=[]; const f=(l,a,b)=>{ const d=a-b; if(d) parts.push(`${l} ${d>0?'+':''}${d}`); };
+  f('서비스',c.services,prev.services); f('메뉴',c.nodes,prev.nodes); f('처리',c.entries,prev.entries); f('템플릿',c.templates,prev.templates); f('공통 IVR',c.modules,prev.modules);
+  return parts.length? ('이전 버전 대비 '+parts.join(', ')) : '항목 수 변화 없음 (내용 수정)'; }
+function addHistManual(){ const note=prompt('이력으로 남길 변경 내용'); if(note===null)return; const editor=prompt('편집자 이름',lastEditor())||''; try{localStorage.setItem('ivr_last_editor',editor);}catch(e){} addHistory(editor,note); renderHistory($('#content')); toast('이력을 추가했습니다'); }
+function delHist(id){ if(!confirm('이 이력 항목을 삭제할까요?'))return; state.history=(state.history||[]).filter(h=>h.id!==id); save(); renderHistory($('#content')); }
+function renderHistory(c){
+  const h=(state.history||[]).slice().reverse();
+  c.className='content';
+  c.innerHTML=`<div class="valpane">
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
+      <b style="font-size:15px">이력관리 (${(state.history||[]).length})</b>
+      <span class="muted" style="font-size:12px">공유본을 발행할 때마다 버전·일시·편집자·변경내용이 기록됩니다.</span>
+      <div class="spacer" style="flex:1"></div>
+      <button class="btn sm edit-only" onclick="addHistManual()">+ 이력 직접 추가</button>
+    </div>
+    <div class="hint" style="max-width:920px">이 이력은 발행 시 공유본에 함께 담겨, 도메인(읽기전용)에서도 그대로 보입니다.</div>
+    ${h.length? h.map((e,i)=>{ const prev=h[i+1];
+      return `<div class="tpl-card" style="max-width:920px">
+        <div class="thead"><span class="tno">v${e.ver}</span><span class="tname">${esc(e.note)}</span>
+          <div class="spacer" style="flex:1"></div>
+          <span class="muted" style="font-size:12px">${esc(fmtTs(e.ts))} · ${esc(e.editor)}</span>
+          <button class="btn sm ghost danger edit-only" onclick="delHist('${e.id}')">✕</button></div>
+        <div class="muted" style="font-size:11.5px">${esc(histDelta(e.counts, prev&&prev.counts))}</div>
+      </div>`; }).join('') : '<div class="insp-empty">아직 발행 이력이 없습니다. 상단 <b>📤 공유본 발행</b> 시 기록됩니다.</div>'}
+  </div>`;
 }
 function stamp(){ const d=new Date(); const p=x=>String(x).padStart(2,'0'); return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`; }
 function csvCell(v){ v=(v==null?'':String(v)).replace(/"/g,'""'); return `"${v}"`; }
@@ -12796,14 +13001,14 @@ function exportCSV(){
   const md=Math.max(...state.services.map(maxDepth),1);
   let header=['서비스','대표번호'];
   for(let d=1;d<=md;d++){ header.push(`${d}DEPTH번호`,`${d}DEPTH항목`); }
-  header.push('멘트','회원구분','Action','실행상세','템플릿코드','알림톡관리명','버튼URL','비고');
+  header.push('분기조건','멘트','회원구분','조건값','Action','실행상세','템플릿코드','알림톡관리명','버튼URL','비고');
   const lines=[header.map(csvCell).join(',')];
   for(const s of state.services){
     for(const r of flatten(s)){
       const cols=[s.name,s.phone];
       for(let d=1;d<=md;d++){ const seg=r.path[d-1]; cols.push(seg?seg.num:'',seg?seg.label:''); }
       const e=r.e; const tpl=e&&e.templateId?state.templates.find(t=>t.id===e.templateId):null;
-      cols.push(r.node.ment||'', e?e.member:'', e?e.action:'', e?e.detail:'', tpl?(tpl.code||''):'', tpl?stripIvr(tpl.name):'', e?e.url:'', e?(e.note||''):'');
+      cols.push(r.node.branch||'', r.node.ment||'', e?e.member:'', e?(e.cond||''):'', e?e.action:'', e?e.detail:'', tpl?(tpl.code||''):'', tpl?stripIvr(tpl.name):'', e?e.url:'', e?(e.note||''):'');
       lines.push(cols.map(csvCell).join(','));
     }
   }
