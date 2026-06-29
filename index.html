@@ -12126,16 +12126,35 @@ function normalizeRaw(raw, alim){
   return st;
 }
 const DEFAULT_CLOSED_MENT='안녕하세요. 고객센터입니다.\n지금은 상담 운영시간이 아닙니다.\n운영시간은 평일 오전 9시부터 오후 6시까지이며, 주말 및 공휴일은 휴무입니다.\n운영시간에 다시 연락 주시기 바랍니다. 감사합니다.';
-function ensureOperating(st){ if(!st.operating) st.operating={hours:'평일 09:00~18:00', closedLabel:'평일 18시 이후 · 주말 · 공휴일', closedMent:DEFAULT_CLOSED_MENT}; }
-function setOp(f,v){ if(!state.operating)ensureOperating(state); state.operating[f]=v; save(); }
-function opBannerHtml(){ const op=state.operating||{hours:'',closedLabel:'',closedMent:''};
+const DEFAULT_OPEN_MENT='안녕하세요. 고객센터입니다.\n원하시는 서비스의 번호를 눌러주세요.';
+function defaultOperating(){ return {hours:'평일 09:00~18:00', closedLabel:'평일 18시 이후 · 주말 · 공휴일', openMent:DEFAULT_OPEN_MENT, closedMent:DEFAULT_CLOSED_MENT}; }
+function ensureOperating(st){
+  if(!st.operating) st.operating=defaultOperating();           // 전역값(마이그레이션 시드)
+  if(!st.operating.openMent) st.operating.openMent=DEFAULT_OPEN_MENT;
+  (st.services||[]).forEach(s=>{
+    if(!s.operating){ const g=st.operating; s.operating={hours:g.hours,closedLabel:g.closedLabel,openMent:g.openMent||DEFAULT_OPEN_MENT,closedMent:g.closedMent}; }
+    else { if(!s.operating.openMent) s.operating.openMent=DEFAULT_OPEN_MENT; if(!s.operating.closedMent) s.operating.closedMent=DEFAULT_CLOSED_MENT; if(!s.operating.hours) s.operating.hours=defaultOperating().hours; if(!s.operating.closedLabel) s.operating.closedLabel=defaultOperating().closedLabel; }
+  });
+}
+function svcOperating(s){ if(!s.operating) s.operating=defaultOperating(); return s.operating; }
+function setOp(f,v){ const s=curService(); if(!s)return; svcOperating(s)[f]=v; save(); }
+function opBannerHtml(){ const op=svcOperating(curService());
+  const ta='width:100%;margin-top:3px;min-height:48px;border:1px solid var(--line);border-radius:7px;padding:7px;font-size:12px;line-height:1.5';
   return `<div class="op-banner">
-    <b>⏰ 운영시간 조건 (IVR 전체 공통)</b>
+    <b>⏰ 운영시간 조건 (업체별)</b>
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;margin-top:5px">
-      운영시간 <input class="op-field" value="${esc(op.hours||'')}" onchange="setOp('hours',this.value)" style="border:1px solid var(--line);border-radius:6px;padding:3px 7px;width:150px"> → 정상 IVR 메뉴 안내
+      운영시간 <input class="op-field" value="${esc(op.hours||'')}" onchange="setOp('hours',this.value)" style="border:1px solid var(--line);border-radius:6px;padding:3px 7px;width:150px"> → 전체 메뉴 정상 안내
     </div>
-    <div style="font-size:12px;color:var(--muted);margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">그 외(<input class="op-field" value="${esc(op.closedLabel||'')}" onchange="setOp('closedLabel',this.value)" style="border:1px solid var(--line);border-radius:6px;padding:3px 7px;width:230px">) → 🔊 휴일 안내 멘트 송출</div>
-    <textarea class="op-field" onchange="setOp('closedMent',this.value)" style="width:100%;margin-top:6px;min-height:54px;border:1px solid var(--line);border-radius:7px;padding:7px;font-size:12px;line-height:1.5">${esc(op.closedMent||'')}</textarea>
+    <div style="font-size:11.5px;color:var(--muted);margin-top:7px">🔊 운영시간 내 IVR 첫 멘트</div>
+    <textarea class="op-field" onchange="setOp('openMent',this.value)" placeholder="운영시간 내 첫 안내(인사) 멘트" style="${ta}">${esc(op.openMent||'')}</textarea>
+    <div style="font-size:12px;color:var(--muted);margin-top:8px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">운영시간 외(<input class="op-field" value="${esc(op.closedLabel||'')}" onchange="setOp('closedLabel',this.value)" style="border:1px solid var(--line);border-radius:6px;padding:3px 7px;width:220px">) 처리:</div>
+    <div style="font-size:12px;margin-top:3px;line-height:1.8">
+      🟢 <b>ARS 자체해결</b>(잔액조회·분실신고/해제·충전취소 등) → <b>24시간</b> 정상<br>
+      🟢 <b>알림톡 발송</b> → 24시간 정상(자동)<br>
+      🕘 <b>상담원 연결</b> → 운영시간 외 안내 멘트 송출 ↓
+    </div>
+    <div style="font-size:11.5px;color:var(--muted);margin-top:3px">🔊 운영시간 외 IVR 멘트(상담 불가 안내)</div>
+    <textarea class="op-field" onchange="setOp('closedMent',this.value)" placeholder="운영시간 외 안내 멘트" style="${ta}">${esc(op.closedMent||'')}</textarea>
   </div>`;
 }
 function labelSet(arr){ return arr.map(n=>(n.label||'').trim()).sort().join('|'); }
@@ -12416,6 +12435,9 @@ function nodeHtml(n,isRoot){
   if(n.branch) chips+=`<span class="chip" style="background:#fef0d8;color:#854f0b;border-color:#fac775" title="분기 조건">⑂ ${esc(n.branch)}</span>`;
   mem.forEach(m=>chips+=`<span class="chip mem">${esc(m)}</span>`);
   if(n.entries.length){ const ck=nodeCatKey(n); if(ck!=='none') chips+=`<span class="chip" style="background:${CAT[ck].bg};color:${CAT[ck].tx};border-color:${CAT[ck].bd}">${CAT[ck].label}</span>`; }
+  { const av=nodeAvail(n);
+    if(av==='24h') chips+=`<span class="chip" style="background:var(--ok-soft);color:var(--ok);border-color:#9fe1cb" title="ARS/알림톡 자동 — 24시간 대응">24시간</span>`;
+    else if(av==='hours') chips+=`<span class="chip" style="background:var(--amber-soft);color:var(--amber);border-color:#fac775" title="상담원 연결 — 운영시간만, 시간외 안내멘트">운영시간만</span>`; }
   if(n.ment) chips+=`<span class="chip" style="background:var(--amber-soft);color:var(--amber);border-color:#fac775" title="${esc(n.ment).slice(0,120)}">🔊</span>`;
   if(mod) chips+=`<span class="chip" style="background:var(--ok-soft);color:var(--ok);border-color:#9fe1cb">📦 ${esc(mod.name)}</span>`;
   if(!hasKids && n.entries.length===0 && !mod) chips+=`<span class="chip warnflag">처리없음</span>`;
@@ -12671,6 +12693,8 @@ const CAT={
 function actCatKey(action){ const a=action||''; if(/상담원/.test(a))return 'agent'; if(/ARS|API/.test(a))return 'api'; if(/알림톡/.test(a))return 'talk'; return ''; }
 function nodeCatKey(n){ const ks=n.entries.map(e=>actCatKey(e.action)).filter(Boolean);
   if(ks.includes('agent'))return 'agent'; if(ks.includes('api'))return 'api'; if(ks.includes('talk'))return 'talk'; return 'none'; }
+function nodeAvail(n){ if(!n.entries||!n.entries.length) return ''; const ks=n.entries.map(e=>actCatKey(e.action));
+  if(ks.includes('agent')) return 'hours'; if(ks.some(k=>k==='api'||k==='talk')) return '24h'; return ''; }
 function vizColor(n){ if(effChildren(n).length && !n.entries.length) return CAT.none; return CAT[nodeCatKey(n)]; }
 let vizModuleId=null;
 function renderViz(c){
@@ -12699,7 +12723,8 @@ function renderViz(c){
     const kids=effChildren(n); const col=vizColor(n), hasKids=kids.length>0, collapsed=n._collapsed===true;
     const mod=n.moduleRef?findModule(n.moduleRef):null;
     const mem=[...new Set(n.entries.map(e=>e.member).filter(Boolean))];
-    const ck=nodeCatKey(n); const catTxt=mod?('📦 '+mod.name):(hasKids&&!n.entries.length?(collapsed?'▸ 펼치기':kids.length+'개 하위'):(CAT[ck].label||''));
+    const ck=nodeCatKey(n); const av=nodeAvail(n); const avTxt=av==='24h'?' · 24시간':(av==='hours'?' · 운영시간만':'');
+    const catTxt=mod?('📦 '+mod.name):(hasKids&&!n.entries.length?(collapsed?'▸ 펼치기':kids.length+'개 하위'):((CAT[ck].label||'')+avTxt));
     const lbl=esc((n.branch?'⑂ ':'')+((n.label||'').length>17?n.label.slice(0,16)+'…':(n.label||'(이름없음)')));
     boxes+=`<g style="cursor:pointer" onclick="vizToggle('${n.id}')">
       <rect x="${n.__x}" y="${n.__y}" width="${BOXW}" height="${BOXH}" rx="9" fill="${col.bg}" stroke="${mod?'#1d9e75':col.bd}" stroke-width="1.5"${mod?' stroke-dasharray="4 2"':''}/>
@@ -12721,7 +12746,7 @@ function renderViz(c){
       <span class="chip" style="background:${CAT.talk.bg};color:${CAT.talk.tx};border-color:${CAT.talk.bd}">${CAT.talk.label}</span>
       <span class="chip" style="background:${CAT.api.bg};color:${CAT.api.tx};border-color:${CAT.api.bd}">${CAT.api.label}</span>
     </div>
-    <div style="padding:8px 18px;font-size:12px;background:var(--amber-soft);border-bottom:1px solid #fac775">⏰ <b>운영시간</b> ${esc((state.operating&&state.operating.hours)||'')} → 정상 IVR 안내 · 그 외(${esc((state.operating&&state.operating.closedLabel)||'')}) → 🔊 휴일 안내 멘트</div>
+    <div style="padding:8px 18px;font-size:12px;background:var(--amber-soft);border-bottom:1px solid #fac775">⏰ <b>운영시간</b> ${esc(svcOperating(s).hours||'')} → 전체 정상 · 그 외(${esc(svcOperating(s).closedLabel||'')}): ARS 24시간 · 상담원 연결은 운영시간 외 멘트</div>
     <div style="overflow:auto;padding:10px"><svg width="${W}" height="${H}" style="display:block">${edges}${boxes}</svg></div>
   </div>`;
 }
@@ -13037,14 +13062,12 @@ function exportCSV(){
   let header=['서비스','대표번호'];
   for(let d=1;d<=md;d++){ header.push(`${d}DEPTH번호`,`${d}DEPTH항목`); }
   header.push('분기조건','멘트','회원구분','조건값','Action','실행상세','템플릿코드','알림톡관리명','버튼URL','비고');
-  const op=state.operating||{};
-  const lines=[
-    ['[운영시간 조건]','운영시간',op.hours||'','→ 정상 IVR 메뉴 안내'].map(csvCell).join(','),
-    ['','휴일/시간외',op.closedLabel||'','→ 휴일 안내 멘트'].map(csvCell).join(','),
-    ['','휴일 안내 멘트',(op.closedMent||'').replace(/\n/g,' ')].map(csvCell).join(','),
-    '',
-    header.map(csvCell).join(',')
-  ];
+  const lines=[['[업체별 운영시간 조건]'].map(csvCell).join(',')];
+  lines.push(['서비스','운영시간','운영시간외','운영시간내 첫멘트','운영시간외 멘트'].map(csvCell).join(','));
+  for(const s of state.services){ const op=svcOperating(s);
+    lines.push([s.name,op.hours||'',op.closedLabel||'',(op.openMent||'').replace(/\n/g,' '),(op.closedMent||'').replace(/\n/g,' ')].map(csvCell).join(',')); }
+  lines.push(''); lines.push('[ARS 자체해결(분실신고/해제·잔액조회·충전취소 등)은 24시간 · 상담원 연결은 운영시간만]'); lines.push('');
+  lines.push(header.map(csvCell).join(','));
   for(const s of state.services){
     for(const r of flatten(s)){
       const cols=[s.name,s.phone];
